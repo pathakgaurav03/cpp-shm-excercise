@@ -37,7 +37,7 @@ void imageIpc::cleanUp(const char* _name)
     shared_memory_object::remove(_name);
 }
 
-int imageIpc::producerSetup()
+imageIpc::ErrorCode imageIpc::producerSetup()
 {
     shm.truncate(sizeof(struct genImage));
 
@@ -46,29 +46,31 @@ int imageIpc::producerSetup()
 
     // Get the address of the mapped region
     addr = region.get_address();
-    return 0;
+    return imageIpc::SUCCESS;
 }
 
-int imageIpc::write_in_buffer(const int width, const int height, const std::vector<std::vector<int>>& src)
+imageIpc::ErrorCode
+imageIpc::write_in_buffer(const int width, const int height, const std::vector<std::vector<int>>& src)
 {
     // Sanitize user provide input
-    std::size_t sum = 0;
+    std::size_t srcSize = 0;
     for (auto&& i : src)
     {
-        sum += i.size();
+        srcSize += i.size();
     }
 
-    if (width == 0 || height == 0 || (sum != static_cast<size_t>(width * height)))
+    if (width == 0 || height == 0 || srcSize != static_cast<size_t>(width * height))
     {
-        std::cout << "invalid input" << "size =" << src.size() << std::endl;
-        return -1;
+        return imageIpc::ERROR_INVALID_INPUT;
     }
 
     genImage* image;
     if (addr == nullptr)
     {
-        std::cout << "calling setup func" << std::endl;
-        producerSetup();
+        if (producerSetup() != imageIpc::SUCCESS)
+        {
+            return imageIpc::ERROR_UNKNOWN;
+        };
         image = new (addr) genImage;
     }
 
@@ -76,12 +78,11 @@ int imageIpc::write_in_buffer(const int width, const int height, const std::vect
     image = static_cast<genImage*>(addr);
     {
         // initialize metadata
-        scoped_lock<interprocess_mutex> lock(image->mutex);
+        scoped_lock<interprocess_mutex> lock(image->metaDataMutex);
         image->width  = width;
         image->height = height;
         image->size   = width * height;
         randomStrGen(20, image->name);
-        std::cout << "name in parent=" << image->name << std::endl;
     }
 
     // Open data buffer shared memory and map it in the process
@@ -107,57 +108,54 @@ int imageIpc::write_in_buffer(const int width, const int height, const std::vect
 
     // Notify consumer of new data
     {
-        scoped_lock<interprocess_mutex> lock(image->mutex);
+        scoped_lock<interprocess_mutex> lock(image->metaDataMutex);
         image->isConsumed = false;
         image->isProduced = true;
         image->cond_empty.notify_one();
+
+        // wait for consumer to finish
+        image->cond_full.wait(lock);
     }
 
-    // wait for consumer to finish
-    {
-        scoped_lock<interprocess_mutex> lock(image->mutex);
-        if (!image->isConsumed)
-        {
-            std::cout << "waiting to be consumed..." << std::endl;
-            image->cond_full.wait(lock);
-            std::cout << "isConsumed " << image->isConsumed << " " << std::endl;
-        }
-    }
     shared_memory_object::remove(image->name);
-
-    return 0;
+    return imageIpc::SUCCESS;
 }
 
-int imageIpc::consumerSetup()
+imageIpc::ErrorCode imageIpc::consumerSetup()
 {
     // map the shared memory in process address space
     region = mapped_region(shm, read_write);
 
     // Get the address of the mapped region
     addr = region.get_address();
-    return 0;
+    return imageIpc::SUCCESS;
 }
 
-int imageIpc::read_from_buffer(std::vector<std::vector<int>>& vec)
+imageIpc::ErrorCode imageIpc::read_from_buffer(std::vector<std::vector<int>>& vec)
 {
     if (addr == nullptr)
     {
-        std::cout << "calling consumer setup func" << std::endl;
         consumerSetup();
     }
 
+    char* dataBufferName;
     genImage* image = static_cast<genImage*>(addr);
+    int dataWidth, dataHeight;
     {
         // Wait for data to be produced in buffer
-        scoped_lock<interprocess_mutex> lock(image->mutex);
+        scoped_lock<interprocess_mutex> lock(image->metaDataMutex);
         if (!image->isProduced)
         {
             image->cond_empty.wait(lock);
         }
+
+        dataBufferName = image->name;
+        dataWidth      = image->width;
+        dataHeight     = image->height;
     }
 
     // // Open data buffer shared memory and map it in the process
-    shared_memory_object shMem{open_or_create, image->name, read_write};
+    shared_memory_object shMem{open_only, dataBufferName, read_write};
     mapped_region regionData(shMem, read_write);
     void* addr1 = regionData.get_address();
     auto data   = static_cast<int*>(addr1);
@@ -165,44 +163,24 @@ int imageIpc::read_from_buffer(std::vector<std::vector<int>>& vec)
     // Read data
     {
         scoped_lock<interprocess_mutex> lock(image->dataMutex);
-        for (int i = 0; i < image->width; i++)
+        for (int i = 0; i < dataWidth; i++)
         {
             std::vector<int> v2;
-            for (int j = 0; j < image->height; j++)
+            for (int j = 0; j < dataHeight; j++)
             {
-                // std::cout << data[i * image->height + j] << " ";
-                v2.push_back(data[i * image->height + j]);
+                v2.push_back(data[i * dataHeight + j]);
             }
             vec.push_back(v2);
-            // std::cout << std::endl;
         }
     }
 
     // notify producer that data has been consumed
     {
-        std::cout << "notify Producer" << std::endl;
-        scoped_lock<interprocess_mutex> lock(image->mutex);
+        scoped_lock<interprocess_mutex> lock(image->metaDataMutex);
         image->isConsumed = true;
         image->isProduced = false;
         image->cond_full.notify_one();
     }
-    shared_memory_object::remove(image->name);
-
-    return 0;
+    shared_memory_object::remove(dataBufferName);
+    return imageIpc::SUCCESS;
 }
-
-// g++ example/main.cpp -limage_ipc -L ./
-// export LD_LIBRARY_PATH=/home/s0002010/exp/image/cpp-shm-exercise
-// cmake --build ./
-
-/// refinement points-
-// use of generic types for pixels, static and constness, 3d pixel, API capabilities and flexibility
-// Logging, Error handling, tests
-
-// Think about circular buffer ... big buffer shared by processes.
-
-// Most importantly synchronization between processes (simple case done)
-
-// WHAT IF THERE ARE MORE THAN TWO PROCESSE
-
-// multithreading

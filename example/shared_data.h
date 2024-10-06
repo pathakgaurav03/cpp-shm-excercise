@@ -21,7 +21,7 @@ struct genImage
     int width;
     int height;
     int size;
-    boost::interprocess::interprocess_mutex mutex;
+    boost::interprocess::interprocess_mutex metaDataMutex;
     boost::interprocess::interprocess_mutex dataMutex;
     boost::interprocess::interprocess_condition cond_empty;
     boost::interprocess::interprocess_condition cond_full;
