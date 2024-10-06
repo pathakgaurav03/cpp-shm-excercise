@@ -1,7 +1,5 @@
 #ifndef CPPPROJECT_IMAGE_IPC_H
 #define CPPPROJECT_IMAGE_IPC_H
-
-#include "image_ipc_types.hpp"
 #include "shared_data.h"
 #include <string>
 
